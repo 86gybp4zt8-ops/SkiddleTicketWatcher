@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""
+Skiddle Ticket Availability Watcher
+------------------------------------
+Polls the Skiddle API for one or more events and sends a push notification
+(via ntfy.sh) the moment tickets become available.
+
+SETUP
+1. Apply for a free API key: https://www.skiddle.com/api/join.php
+2. Edit the CONFIG section below with your API key, event ID(s), and an
+   ntfy.sh topic name (make one up -- e.g. "amy-skiddle-watch-8214";
+   topics are just unguessable strings, no account needed).
+3. Install dependencies:      pip install requests
+4. Subscribe to your topic so you get the push:
+     - Phone: install the ntfy app (iOS/Android) and subscribe to your topic
+     - Desktop: visit https://ntfy.sh/<your-topic> in a browser and click Subscribe,
+       or `pip install requests` isn't needed for this part -- just use the app/web UI
+5. Run once manually first to confirm it works:
+     python skiddle_ticket_watcher.py
+   On the first run per event it prints the raw JSON response -- check that
+   the script's guess at the "tickets available" field looks right (see the
+   NOTE below).
+6. Schedule it to run every few minutes (see scheduling notes at the bottom
+   of this file).
+
+NOTE ON THE SKIDDLE RESPONSE FORMAT
+Skiddle's public docs describe the request parameters clearly but don't
+fully document the shape of the event-details response body. This script
+guesses at a few plausible field names for ticket availability. The first
+time it runs for each event, it prints the raw JSON so you can check the
+guess against reality. If it picks the wrong field (or returns "unknown"),
+look at the printed JSON, find the correct key/value, and update the
+tickets_available() function below (or tell me what the field looks like
+and I'll fix it for you).
+"""
+
+import requests
+import json
+import os
+
+
+def load_api_key():
+    """
+    Loads the Skiddle API key from (in order of priority):
+      1. The SKIDDLE_API_KEY environment variable
+      2. A local, untracked .env file in the same folder as this script,
+         containing a line like: SKIDDLE_API_KEY=your_real_key_here
+    The key itself is never hardcoded or committed to source control.
+    """
+    key = os.environ.get("SKIDDLE_API_KEY")
+    if key:
+        return key
+
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if os.path.exists(env_path):
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("SKIDDLE_API_KEY="):
+                    return line.split("=", 1)[1].strip()
+
+    raise RuntimeError(
+        "No Skiddle API key found. Set the SKIDDLE_API_KEY environment variable, "
+        "or create a .env file next to this script containing:\n"
+        "SKIDDLE_API_KEY=your_real_key_here"
+    )
+
+
+# ------------------ CONFIG ------------------
+API_KEY = load_api_key()                  # loaded from env var or local .env -- see above
+EVENT_IDS = [123456, 234567]              # Skiddle event IDs you want to watch
+NTFY_TOPIC = "your-unique-topic-name"     # pick any unused topic string; see https://ntfy.sh
+STATE_FILE = "skiddle_state.json"         # tracks previous availability between runs, so
+                                           # you're only notified on a CHANGE, not every run
+# ---------------------------------------------
+
+DETAILS_URL = "https://www.skiddle.com/api/v1/events/{id}/"
+
+
+def load_state():
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    return {}
+
+
+def save_state(state):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2)
+
+
+def fetch_event(event_id):
+    resp = requests.get(
+        DETAILS_URL.format(id=event_id),
+        params={"api_key": API_KEY, "description": 1},
+        timeout=15,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def tickets_available(event_json):
+    """
+    Try a handful of plausible field names for ticket availability.
+    The details endpoint typically wraps the event under results[0].
+    Adjust this once you've confirmed the real field from the printed JSON.
+    Returns True/False, or None if it couldn't be determined.
+    """
+    try:
+        event = event_json["results"][0]
+    except (KeyError, IndexError, TypeError):
+        event = event_json
+
+    for key in ("ticketsavailable", "entryprice", "entprice", "tickets"):
+        if key in event:
+            val = event[key]
+            if isinstance(val, bool):
+                return val
+            if isinstance(val, list):
+                return len(val) > 0
+            if isinstance(val, str):
+                return val not in ("0", "", "None")
+            if isinstance(val, (int, float)):
+                return bool(val)
+
+    return None  # unknown -- check the raw JSON printout
+
+
+def notify(title, message):
+    requests.post(
+        f"https://ntfy.sh/{NTFY_TOPIC}",
+        data=message.encode("utf-8"),
+        headers={"Title": title, "Priority": "high", "Tags": "ticket"},
+        timeout=10,
+    )
+
+
+def main():
+    state = load_state()
+
+    for event_id in EVENT_IDS:
+        first_run = str(event_id) not in state
+
+        try:
+            data = fetch_event(event_id)
+        except requests.RequestException as e:
+            print(f"[{event_id}] Error fetching event: {e}")
+            continue
+
+        if first_run:
+            print(f"--- Raw response for event {event_id} (first run) ---")
+            print(json.dumps(data, indent=2)[:3000])
+            print("--- end raw response ---")
+
+        available = tickets_available(data)
+        previous = state.get(str(event_id))
+
+        if available is None:
+            print(f"[{event_id}] Could not determine ticket status -- check raw JSON above.")
+        elif available and not previous:
+            print(f"[{event_id}] AVAILABLE -> sending notification")
+            notify("Tickets available!", f"Skiddle event {event_id} now shows tickets available.")
+        else:
+            print(f"[{event_id}] available={available} (no change)")
+
+        state[str(event_id)] = bool(available)
+
+    save_state(state)
+
+
+if __name__ == "__main__":
+    main()
+
+# ------------------ SCHEDULING ------------------
+# Run this every few minutes rather than in a loop, so it's not hammering
+# Skiddle's servers continuously.
+#
+# macOS/Linux (cron) -- runs every 5 minutes:
+#   crontab -e
+#   then add:
+#   */5 * * * * /usr/bin/python3 /full/path/to/skiddle_ticket_watcher.py >> /full/path/to/skiddle_log.txt 2>&1
+#
+# Windows (Task Scheduler):
+#   Create a new task -> Trigger: "Repeat task every 5 minutes" ->
+#   Action: "python.exe" with argument "C:\full\path\to\skiddle_ticket_watcher.py"
+# --------------------------------------------------
